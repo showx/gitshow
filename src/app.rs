@@ -389,11 +389,18 @@ impl GitShow {
                 };
                 match result {
                     Ok(message) => {
-                        if matches!(kind, JobKind::Commit) {
+                        let committed = matches!(kind, JobKind::Commit);
+                        if committed {
                             self.commit_msg.clear();
                         }
-                        self.note(message);
                         self.reload_report();
+                        if committed
+                            && !self.banner.as_ref().is_some_and(|banner| banner.error)
+                        {
+                            self.focus_new_commit();
+                        } else if !committed {
+                            self.note(message);
+                        }
                     }
                     Err(err) => self.fail(err),
                 }
@@ -563,7 +570,12 @@ impl eframe::App for GitShow {
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.add_space(6.0);
-                    page_tab(ui, &mut self.page, Page::History, "历史");
+                    let history_label = if self.commits.is_empty() {
+                        "历史".to_string()
+                    } else {
+                        format!("历史 {}", self.commits.len())
+                    };
+                    page_tab(ui, &mut self.page, Page::History, &history_label);
                     let changes = self
                         .snap
                         .as_ref()
@@ -619,6 +631,15 @@ impl eframe::App for GitShow {
                 });
             });
         });
+
+        if self.repo.is_some() {
+            egui::Panel::bottom("history")
+                .resizable(true)
+                .default_size(230.0)
+                .min_size(120.0)
+                .max_size(420.0)
+                .show(ui, |ui| self.history_panel(ui));
+        }
 
         let mut open_recent = None;
         let mut forget = None;
@@ -803,12 +824,16 @@ impl GitShow {
             .corner_radius(6)
             .inner_margin(Margin::symmetric(10, 8))
             .show(ui, |ui| {
-                ui.horizontal_top(|ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
                     if ui.button("关闭").clicked() {
                         close = true;
                     }
-                    ui.add(Label::new(text).wrap_mode(TextWrapMode::Wrap));
+                    ui.label(
+                        RichText::new(if error { "操作失败" } else { "Git 输出" }).strong(),
+                    );
                 });
+                ui.add(Label::new(text).wrap_mode(TextWrapMode::Wrap));
             });
         ui.add_space(6.0);
         if close {
@@ -943,14 +968,39 @@ impl GitShow {
         self.diff_panel(ui, "选择左侧文件查看差异");
     }
 
+    fn focus_new_commit(&mut self) {
+        let Some(commit) = self.commits.first().cloned() else {
+            self.banner = None;
+            self.status = "已提交".into();
+            return;
+        };
+        self.selected_commit = Some(commit.id.clone());
+        self.selected_file = None;
+        self.diff.clear();
+        self.page = Page::History;
+        self.banner = None;
+        self.load_commit_detail();
+        self.status = format!(
+            "已提交 {}  {}  ·  {} 个文件",
+            commit.short_id,
+            commit.summary,
+            self.commit_files.len()
+        );
+    }
+
     fn on_page_changed(&mut self) {
         match self.page {
             Page::History => {
-                if self.selected_file.is_some() {
-                    self.load_history_diff();
-                } else {
+                let known = self
+                    .selected_commit
+                    .as_ref()
+                    .is_some_and(|id| self.commits.iter().any(|commit| &commit.id == id));
+                if !known {
+                    self.selected_commit = self.commits.first().map(|commit| commit.id.clone());
+                    self.selected_file = None;
                     self.diff.clear();
                 }
+                self.load_commit_detail();
             }
             Page::Changes => {
                 if self.selected.is_some() {
@@ -986,76 +1036,119 @@ impl GitShow {
         }
     }
 
-    fn history_view(&mut self, ui: &mut egui::Ui) {
+    fn history_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("历史  {}", self.commits.len())).strong());
+            ui.label(RichText::new("点击一条提交查看其中的文件").small().weak());
+        });
         if self.commits.is_empty() {
-            empty_state(ui, "还没有提交", "第一次提交后，历史会显示在这里。");
+            ui.add_space(8.0);
+            ui.label(RichText::new("还没有提交").weak());
             return;
         }
-        let list_height = (ui.available_height() * 0.42).clamp(150.0, 320.0);
-        let mut pick_commit = None;
+        let mut pick = None;
         ScrollArea::vertical()
             .id_salt("history")
-            .max_height(list_height)
+            .auto_shrink(Vec2b::FALSE)
             .show(ui, |ui| {
-                for commit in &self.commits {
-                    let selected = self.selected_commit.as_ref() == Some(&commit.id);
-                    if commit_row(ui, commit, selected) {
-                        pick_commit = Some(commit.id.clone());
+                for (index, commit) in self.commits.iter().enumerate() {
+                    let selected = self.page == Page::History
+                        && self.selected_commit.as_ref() == Some(&commit.id);
+                    if commit_row(ui, commit, selected, index == 0) {
+                        pick = Some(commit.id.clone());
                     }
                 }
             });
-        if let Some(id) = pick_commit {
+        if let Some(id) = pick {
             self.selected_commit = Some(id);
             self.selected_file = None;
             self.diff.clear();
+            self.page = Page::History;
             self.load_commit_detail();
         }
+    }
 
-        ui.add_space(6.0);
-        if let Some(commit) = self
+    fn history_view(&mut self, ui: &mut egui::Ui) {
+        if self.commits.is_empty() {
+            empty_state(ui, "还没有提交", "第一次提交后，记录会显示在窗口下方。");
+            return;
+        }
+        let Some(commit) = self
             .selected_commit
             .as_ref()
             .and_then(|id| self.commits.iter().find(|commit| &commit.id == id))
             .cloned()
-        {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&commit.summary).strong());
-                if ui.small_button("复制哈希").clicked() {
-                    ui.ctx().copy_text(commit.id.clone());
-                    self.status = "已复制完整哈希".into();
-                }
-            });
-            ui.label(
-                RichText::new(format!("{}   {}   {}", commit.short_id, commit.author, commit.time))
-                    .small()
-                    .weak(),
-            );
-            ui.add_space(4.0);
-            let mut pick_file = None;
-            ScrollArea::vertical()
-                .id_salt("commit-files")
-                .max_height(120.0)
-                .show(ui, |ui| {
-                    for file in &self.commit_files {
-                        let selected = self.selected_file.as_ref() == Some(&file.path);
-                        let label = match &file.old_path {
-                            Some(old) => format!("{}  {old} → {}", file.status, file.path),
-                            None => format!("{}  {}", file.status, file.path),
-                        };
-                        if ui.selectable_label(selected, label).clicked() {
-                            pick_file = Some(file.path.clone());
+        else {
+            empty_state(ui, "选择一个提交", "在下方历史里点击一条记录。");
+            return;
+        };
+
+        Frame::new()
+            .fill(Color32::from_rgb(28, 40, 58))
+            .corner_radius(6)
+            .inner_margin(Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(&commit.short_id)
+                            .monospace()
+                            .strong()
+                            .size(16.0)
+                            .color(Color32::from_rgb(130, 186, 255)),
+                    );
+                    ui.label(RichText::new(&commit.summary).strong().size(16.0));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("复制哈希").clicked() {
+                            ui.ctx().copy_text(commit.id.clone());
+                            self.status = "已复制完整哈希".into();
                         }
-                    }
+                    });
                 });
-            if let Some(path) = pick_file {
-                self.selected_file = Some(path);
-                self.load_history_diff();
-            }
-        } else {
-            ui.label(RichText::new("选择一个提交").weak());
+                ui.label(
+                    RichText::new(format!(
+                        "{}    {}    {} 个文件",
+                        commit.author,
+                        short_time(&commit.time),
+                        self.commit_files.len()
+                    ))
+                    .color(Color32::from_rgb(176, 182, 192)),
+                );
+            });
+        ui.add_space(8.0);
+
+        let body_height = ui.available_height();
+        let mut pick_file = None;
+        ui.horizontal_top(|ui| {
+            ui.set_min_height(body_height);
+            let files_width = 300.0_f32.min(ui.available_width() * 0.38).max(180.0);
+            ui.vertical(|ui| {
+                ui.set_width(files_width);
+                ui.label(
+                    RichText::new(format!("文件  {}", self.commit_files.len()))
+                        .strong()
+                        .small(),
+                );
+                ScrollArea::vertical()
+                    .id_salt("commit-files")
+                    .auto_shrink(Vec2b::new(true, false))
+                    .show(ui, |ui| {
+                        for file in &self.commit_files {
+                            let selected = self.selected_file.as_ref() == Some(&file.path);
+                            if history_file_row(ui, file, selected) {
+                                pick_file = Some(file.path.clone());
+                            }
+                        }
+                    });
+            });
+            ui.vertical(|ui| {
+                self.diff_panel(ui, "选择左侧文件查看这次提交的差异");
+            });
+        });
+        if let Some(path) = pick_file {
+            self.selected_file = Some(path);
+            self.load_history_diff();
         }
-        ui.add_space(6.0);
-        self.diff_panel(ui, "选择提交中的文件查看差异");
     }
 
     fn diff_panel(&mut self, ui: &mut egui::Ui, placeholder: &str) {
@@ -1222,35 +1315,101 @@ fn section_title(ui: &mut egui::Ui, title: &str, count: usize, action: Option<&s
     clicked
 }
 
-fn commit_row(ui: &mut egui::Ui, commit: &CommitInfo, selected: bool) -> bool {
+fn commit_row(ui: &mut egui::Ui, commit: &CommitInfo, selected: bool, latest: bool) -> bool {
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 30.0), Sense::click());
     let fill = if selected {
         Color32::from_rgb(36, 74, 132)
+    } else if response.hovered() {
+        Color32::from_rgb(42, 46, 54)
     } else {
         Color32::TRANSPARENT
     };
-    let mut clicked = false;
-    Frame::new()
-        .fill(fill)
-        .corner_radius(4)
-        .inner_margin(Margin::symmetric(8, 4))
-        .show(ui, |ui| {
-            let response = ui.add(
-                Label::new(RichText::new(&commit.summary).strong()).sense(Sense::click()),
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 4.0, fill);
+    }
+    let mut row = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink(4.0))
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    row.label(
+        RichText::new(&commit.short_id)
+            .monospace()
+            .color(Color32::from_rgb(130, 186, 255)),
+    );
+    row.add_space(10.0);
+    if latest {
+        row.label(
+            RichText::new("最新")
+                .small()
+                .color(Color32::from_rgb(120, 190, 140)),
+        );
+        row.add_space(8.0);
+    }
+    let summary_width = (row.available_width() - 260.0).max(48.0);
+    row.allocate_ui_with_layout(
+        egui::vec2(summary_width, row.available_height()),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.add(
+                Label::new(RichText::new(&commit.summary).strong())
+                    .wrap_mode(TextWrapMode::Truncate),
             );
-            let meta = ui.add(
-                Label::new(
-                    RichText::new(format!(
-                        "{}    {}    {}",
-                        commit.short_id, commit.author, commit.time
-                    ))
-                    .small()
-                    .color(Color32::from_rgb(150, 156, 166)),
-                )
-                .sense(Sense::click()),
-            );
-            clicked = response.clicked() || meta.clicked();
-        });
-    clicked
+        },
+    );
+    row.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.label(
+            RichText::new(short_time(&commit.time))
+                .small()
+                .color(Color32::from_rgb(150, 156, 166)),
+        );
+        ui.add_space(14.0);
+        ui.label(
+            RichText::new(&commit.author)
+                .small()
+                .color(Color32::from_rgb(186, 190, 198)),
+        );
+    });
+    response.clicked()
+}
+
+fn history_file_row(ui: &mut egui::Ui, file: &CommitFile, selected: bool) -> bool {
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 26.0), Sense::click());
+    let fill = if selected {
+        Color32::from_rgb(36, 74, 132)
+    } else if response.hovered() {
+        Color32::from_rgb(42, 46, 54)
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(rect, 4.0, fill);
+    }
+    let mut row = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink(4.0))
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    let letter = file.status.chars().next().unwrap_or('·');
+    badge(&mut row, letter);
+    let text = match &file.old_path {
+        Some(old) => format!("{old} → {}", file.path),
+        None => file.path.clone(),
+    };
+    row.add(
+        Label::new(text).wrap_mode(TextWrapMode::Truncate),
+    );
+    response.clicked()
+}
+
+fn short_time(time: &str) -> &str {
+    if time.len() >= 16 && time.as_bytes().get(10) == Some(&b' ') {
+        &time[..16]
+    } else {
+        time
+    }
 }
 
 fn badge(ui: &mut egui::Ui, letter: char) {
